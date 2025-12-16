@@ -15,7 +15,7 @@ from pyrogram.types import (
 )
 
 from pytgcalls import PyTgCalls
-from pytgcalls.exceptions import NoActiveGroupCall
+from pyrogram.errors import GroupcallForbidden
 
 import config
 
