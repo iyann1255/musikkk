@@ -11,8 +11,9 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import InputStream, AudioPiped
+from pytgcalls.types.input_stream import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall
 
 import config
@@ -27,7 +28,6 @@ if not (config.API_ID and config.API_HASH and config.BOT_TOKEN and config.ASSIST
 # Regex & Classifier
 # =========================
 YT_RE = re.compile(r"(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/)", re.I)
-
 STREAM_EXTS = (".m3u8", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".flac", ".wav")
 
 
@@ -54,7 +54,7 @@ def is_youtube(s: str) -> bool:
 @dataclass
 class Track:
     title: str
-    source: str  # URL stream
+    source: str  # URL stream (m3u8/mp3/etc)
     requester: str
 
 
@@ -92,30 +92,35 @@ call = PyTgCalls(assistant)
 YTS_ENDPOINT = "https://www.googleapis.com/youtube/v3/search"
 
 
-async def yt_search(query: str):
-    url = "https://www.googleapis.com/youtube/v3/search"
+async def yt_search(query: str, limit: int = 5) -> List[Tuple[str, str]]:
+    """
+    Return: list of (title, url).
+    NOTE: Ini hanya search metadata via YouTube Data API v3 (resmi).
+    """
+    if not config.YOUTUBE_API_KEY:
+        return []
+
     params = {
         "part": "snippet",
         "q": query,
         "type": "video",
-        "maxResults": 5,
-        "key": YOUTUBE_API_KEY,
+        "maxResults": max(1, min(limit, 10)),
+        "key": config.YOUTUBE_API_KEY,
+        "safeSearch": "none",
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+        async with session.get(YTS_ENDPOINT, params=params) as resp:
             data = await resp.json()
 
-    results = []
-    for item in data.get("items", []):
-        vid = item["id"]["videoId"]
-        title = item["snippet"]["title"]
-        results.append({
-            "title": title,
-            "url": f"https://www.youtube.com/watch?v={vid}"
-        })
-
-    return results
+    out: List[Tuple[str, str]] = []
+    for it in data.get("items", []):
+        vid = (it.get("id") or {}).get("videoId")
+        snip = it.get("snippet") or {}
+        title = snip.get("title") or "Unknown"
+        if vid:
+            out.append((title, f"https://www.youtube.com/watch?v={vid}"))
+    return out
 
 
 # =========================
@@ -142,9 +147,7 @@ def yt_kb(results: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     rows = []
     for i, (title, url) in enumerate(results[:5], start=1):
         rows.append([InlineKeyboardButton(f"{i}. Open", url=url)])
-    q = results[0][0] if results else ""
-    search_url = f"https://www.youtube.com/results?search_query={q.replace(' ', '+')}" if q else "https://www.youtube.com"
-    rows.append([InlineKeyboardButton("Open YouTube Search", url=search_url)])
+    rows.append([InlineKeyboardButton("Open YouTube", url="https://www.youtube.com")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -161,7 +164,9 @@ async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
     s.paused = False
 
     try:
-        await call.join_group_call(chat_id, InputStream(AudioPiped(nxt.source)))
+        # py-tgcalls 2.2.8: pass AudioPiped directly (no InputStream wrapper)
+        await call.join_group_call(chat_id, AudioPiped(nxt.source))
+
         await bot.send_message(
             announce_chat_id,
             f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -191,7 +196,7 @@ async def play_next(chat_id: int, announce_chat_id: int):
     nxt = s.queue.pop(0)
     s.playing = nxt
 
-    await call.change_stream(chat_id, InputStream(AudioPiped(nxt.source)))
+    await call.change_stream(chat_id, AudioPiped(nxt.source))
     await bot.send_message(
         announce_chat_id,
         f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -313,6 +318,7 @@ async def handle_play(m: Message, target_chat_id: int, query: str):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open", url=query)]]),
             )
 
+        # tampilkan daftar + tombol open
         return await msg.edit(
             "✅ Hasil YouTube (pilih):\n" + "\n".join([f"{i}. {t[0]}" for i, t in enumerate(results, 1)]),
             reply_markup=yt_kb(results),
