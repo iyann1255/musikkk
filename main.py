@@ -92,36 +92,30 @@ call = PyTgCalls(assistant)
 YTS_ENDPOINT = "https://www.googleapis.com/youtube/v3/search"
 
 
-async def yt_search(query: str, limit: int = 5) -> List[Tuple[str, str]]:
-    """
-    Returns list of (title, url) from YouTube search results.
-    Uses official YouTube Data API. No scraping. No robots.txt issues.
-    """
-    if not config.YOUTUBE_API_KEY:
-        return []
-
+async def yt_search(query: str):
+    url = "https://www.googleapis.com/youtube/v3/search"
     params = {
         "part": "snippet",
         "q": query,
         "type": "video",
-        "maxResults": str(max(1, min(limit, 10))),
-        "key": config.YOUTUBE_API_KEY,
-        "safeSearch": "none",
+        "maxResults": 5,
+        "key": YOUTUBE_API_KEY,
     }
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
-        async with session.get(YTS_ENDPOINT, params=params) as resp:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
             data = await resp.json()
 
-    items = data.get("items", [])
-    out: List[Tuple[str, str]] = []
-    for it in items:
-        vid = (it.get("id") or {}).get("videoId")
-        snip = it.get("snippet") or {}
-        title = snip.get("title") or "Unknown"
-        if vid:
-            out.append((title, f"https://www.youtube.com/watch?v={vid}"))
-    return out
+    results = []
+    for item in data.get("items", []):
+        vid = item["id"]["videoId"]
+        title = item["snippet"]["title"]
+        results.append({
+            "title": title,
+            "url": f"https://www.youtube.com/watch?v={vid}"
+        })
+
+    return results
 
 
 # =========================
