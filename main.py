@@ -1,5 +1,7 @@
 import asyncio
 import re
+import inspect
+import importlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -22,39 +24,6 @@ import config
 # =========================
 if not (config.API_ID and config.API_HASH and config.BOT_TOKEN and config.ASSISTANT_SESSION):
     raise SystemExit("ENV wajib: API_ID, API_HASH, BOT_TOKEN, ASSISTANT_SESSION")
-
-# =========================
-# Stream type auto-detect (py-tgcalls 2.x)
-# =========================
-def _resolve_stream_class():
-    """
-    py-tgcalls 2.x sudah beberapa kali ganti nama / lokasi kelas stream.
-    Fungsi ini mencari kelas stream yang tersedia untuk "stream URL / file path".
-    """
-    candidates = [
-        # candidate tuples: (module, class_name)
-        ("pytgcalls.types.stream", "StreamAudio"),          # beberapa build
-        ("pytgcalls.types.stream", "AudioStream"),          # beberapa build
-        ("pytgcalls.types.input_stream", "AudioPiped"),     # legacy (kalau ada)
-        ("pytgcalls.types.input_stream", "AudioStream"),    # legacy
-        ("pytgcalls.types.input_stream", "InputAudioStream"),  # kemungkinan lain
-    ]
-    last_err = None
-    for mod_name, cls_name in candidates:
-        try:
-            mod = __import__(mod_name, fromlist=[cls_name])
-            cls = getattr(mod, cls_name)
-            return cls
-        except Exception as e:
-            last_err = e
-            continue
-    raise ImportError(
-        "Tidak menemukan kelas stream yang kompatibel di py-tgcalls 2.x. "
-        "Coba jalankan: python -c \"import pkgutil,pytgcalls; print([m.name for m in pkgutil.iter_modules(pytgcalls.__path__)])\" "
-        f"(last_err={last_err})"
-    )
-
-StreamCls = _resolve_stream_class()
 
 # =========================
 # Regex & Classifier
@@ -81,12 +50,87 @@ def is_youtube(s: str) -> bool:
 
 
 # =========================
+# Stream builder for py-tgcalls 2.2.8
+# =========================
+def make_stream(source: str):
+    """
+    py-tgcalls 2.2.8 punya modul pytgcalls.types.stream berisi class stream.
+    Nama class beda-beda antar rilis, jadi kita scan semua class dan coba instantiate.
+    """
+    mod = importlib.import_module("pytgcalls.types.stream")
+
+    classes = []
+    for name, obj in vars(mod).items():
+        if inspect.isclass(obj) and obj.__module__ == mod.__name__:
+            classes.append((name, obj))
+
+    # Prioritaskan nama yang biasanya stream audio
+    def score(n: str) -> int:
+        nlow = n.lower()
+        s = 0
+        if "audio" in nlow:
+            s += 10
+        if "stream" in nlow:
+            s += 6
+        if "piped" in nlow:
+            s += 4
+        if "input" in nlow:
+            s += 2
+        return -s  # sort ascending
+
+    classes.sort(key=lambda x: score(x[0]))
+
+    # Coba beberapa pola constructor yang umum
+    ctor_attempts = [
+        lambda cls: cls(source),
+        lambda cls: cls(input=source),
+        lambda cls: cls(path=source),
+        lambda cls: cls(url=source),
+        lambda cls: cls(source=source),
+    ]
+
+    last_err = None
+    for name, cls in classes:
+        for attempt in ctor_attempts:
+            try:
+                return attempt(cls)
+            except Exception as e:
+                last_err = e
+                continue
+
+    available = [n for n, _ in classes]
+    raise RuntimeError(
+        "Gagal bikin stream object untuk py-tgcalls 2.2.8.\n"
+        f"Available classes in pytgcalls.types.stream: {available}\n"
+        f"Last error: {last_err}"
+    )
+
+
+async def join_call(chat_id: int, stream_obj):
+    """
+    Beberapa build menerima (chat_id, stream) atau (chat_id, stream=...)
+    Kita handle dua-duanya.
+    """
+    try:
+        return await call.join_group_call(chat_id, stream=stream_obj)
+    except TypeError:
+        return await call.join_group_call(chat_id, stream_obj)
+
+
+async def change_call(chat_id: int, stream_obj):
+    try:
+        return await call.change_stream(chat_id, stream=stream_obj)
+    except TypeError:
+        return await call.change_stream(chat_id, stream_obj)
+
+
+# =========================
 # State
 # =========================
 @dataclass
 class Track:
     title: str
-    source: str  # URL stream (m3u8/mp3/etc)
+    source: str
     requester: str
 
 
@@ -179,20 +223,8 @@ def yt_kb(results: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 # =========================
-# Voice Playback (py-tgcalls 2.x)
+# Voice Playback
 # =========================
-def make_stream(source: str):
-    """
-    Buat objek stream dari URL/path.
-    StreamCls di-resolve otomatis.
-    """
-    try:
-        return StreamCls(source)
-    except TypeError:
-        # beberapa class butuh argumen keyword
-        return StreamCls(input=source)
-
-
 async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
     s = st(chat_id)
     if s.playing or not s.queue:
@@ -203,7 +235,9 @@ async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
     s.paused = False
 
     try:
-        await call.join_group_call(chat_id, make_stream(nxt.source))
+        stream_obj = make_stream(nxt.source)
+        await join_call(chat_id, stream_obj)
+
         await bot.send_message(
             announce_chat_id,
             f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -233,7 +267,9 @@ async def play_next(chat_id: int, announce_chat_id: int):
     nxt = s.queue.pop(0)
     s.playing = nxt
 
-    await call.change_stream(chat_id, make_stream(nxt.source))
+    stream_obj = make_stream(nxt.source)
+    await change_call(chat_id, stream_obj)
+
     await bot.send_message(
         announce_chat_id,
         f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
